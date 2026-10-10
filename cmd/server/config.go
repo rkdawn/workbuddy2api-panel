@@ -205,6 +205,13 @@ type Config struct {
 		// tier 0（免费）/ tier 1（无观测）不受限；签到回血越过 floor 自动恢复。
 		// 默认 0 = 关闭；负值钳 0。
 		CreditFloor int64 `json:"credit_floor"`
+		// ModelBlockGrace 模型级全池阻塞的宽限窗（fork 补丁）：最早解封时刻在该
+		// 窗口内时，末端错误保持 503 可重试语义（客户端临近解封自动恢复，不必
+		// 人工重新发起）；窗口外维持上游原行为（400 model_unavailable 一刀切）。
+		// 默认 "0" = 关闭（与上游逐字一致）；空值视作 "0"；负值钳 0；非法时长
+		// 启动报错（fail fast，风格同 breaker_cooldown）。仅影响 modelBlock.Blocked
+		// 覆盖分支，不影响 ErrModelBlocked（11102 上游明说无此模型）的 400 路径。
+		ModelBlockGrace string `json:"model_block_grace"`
 	} `json:"pool"`
 
 	SessionSticky struct {
@@ -226,6 +233,8 @@ type Config struct {
 	ExpiringSoonDur        time.Duration `json:"-"`
 	// CostExploreIntervalDur 解析后的 costTier 探索窗口（issue #136）；0 = 关停。
 	CostExploreIntervalDur time.Duration `json:"-"`
+	// ModelBlockGraceDur 解析后的模型阻塞宽限窗（fork 补丁）；0 = 关停（上游原行为）。
+	ModelBlockGraceDur time.Duration `json:"-"`
 	// ServerReadTimeoutDur 解析后的入站请求读取上限（issue #100）；0 = 不限制。
 	ServerReadTimeoutDur time.Duration `json:"-"`
 }
@@ -526,6 +535,16 @@ func (c *Config) normalize() error {
 	// 积分保底：负值钳 0（= 关闭）。0 是合法默认（关闭），无需空值回落。
 	if c.Pool.CreditFloor < 0 {
 		c.Pool.CreditFloor = 0
+	}
+	// fork 补丁：模型阻塞宽限窗。空值 = 关闭（0，上游原行为）；显式配置才解析，
+	// 非法时长启动报错（fail fast，风格同 breaker_cooldown）；负值钳 0。
+	if s := strings.TrimSpace(c.Pool.ModelBlockGrace); s != "" {
+		if c.ModelBlockGraceDur, err = time.ParseDuration(s); err != nil {
+			return fmt.Errorf("pool.model_block_grace: %w", err)
+		}
+		if c.ModelBlockGraceDur < 0 {
+			c.ModelBlockGraceDur = 0
+		}
 	}
 	if c.Pool.BreakerThreshold <= 0 {
 		c.Pool.BreakerThreshold = 3

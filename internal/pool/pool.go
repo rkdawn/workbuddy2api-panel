@@ -49,6 +49,10 @@ type Pool struct {
 	// 收费与否的判据见 floorBlockedForModel：本地实测台账优先，缺失时用上游目录
 	// 倍率（modelRateOf 注入）兜底，避免「无观测的高价新模型」绕过保底。
 	creditFloor int64
+	// modelBlockGrace 模型级全池阻塞的宽限窗（fork 补丁，handler 读取）：
+	// 最早解封时刻距现在不足该窗口时，末端错误保持 503 可重试语义而非 400。
+	// 0 = 关闭（与上游原行为逐字一致）。SetModelBlockGrace 注入，热重载可改。
+	modelBlockGrace time.Duration
 	// modelRateOf 按 (realm, 模型) 查上游目录积分倍率（"0.79" / "" = 未知）。
 	// 由 main 用 upstream.Client.ModelRate 注入——pool 不依赖 upstream 包（避免
 	// 循环依赖与分层破坏），nil 时倍率兜底不生效（退化为仅本地台账判定）。
@@ -224,6 +228,23 @@ func (p *Pool) SetCreditFloor(n int64) {
 	defer p.mu.Unlock()
 	if n >= 0 {
 		p.creditFloor = n
+	}
+}
+
+// ModelBlockGrace 透出生效的模型阻塞宽限窗（/status 用）。0 = 关闭（上游原行为）。
+func (p *Pool) ModelBlockGrace() time.Duration {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.modelBlockGrace
+}
+
+// SetModelBlockGrace 注入模型阻塞宽限窗（main 从 config 解析后调用）。
+// 0 = 关闭（缺省即现状，零回归）；负值非法保留原值。语义见 handler.modelBlockStatus。
+func (p *Pool) SetModelBlockGrace(d time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if d >= 0 {
+		p.modelBlockGrace = d
 	}
 }
 

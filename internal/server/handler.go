@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 
 	"sync"
@@ -239,6 +240,9 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		// model_costs 对照即可判定「某号为何对某模型不出票」。零值也显式写出
 		// （运维口径：缺失会让人误以为没记录）。
 		"credit_floor": h.cfg.Pool.CreditFloor(),
+		// model_block_grace_sec 模型阻塞宽限窗（fork 补丁，秒；0 = 关闭 = 上游原行为）。
+		// 与 model_locks 对照即可看出「哪些模型的 503 是宽限窗放行的可重试错误」。
+		"model_block_grace_sec": int(h.cfg.Pool.ModelBlockGrace().Seconds()),
 		// cost_explore 事件与 per-model 时间戳（时间值由 encoding/json 写 RFC3339）。
 		"cost_explore": map[string]any{
 			"events_total": exploreEvents,
@@ -1134,6 +1138,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			status = http.StatusTooManyRequests
 			code = "rate_limit_exceeded"
 			msg = "rate limited: all accounts are cooling down, please wait a moment and try again"
+			// fork 补丁：携带精确 Retry-After。日志实证（10-05~10-10，17038 条）：
+			// glm-5.3 的 429 连错段平均 406 次、最长 2387 次——6004 的解封时刻
+			// 上游已给、本地 modelCooldowns 已存，但此前的 429 响应不带任何
+			// 节奏信号，客户端只能按自身策略盲试。仅在解封时刻确凿已知（全池
+			// 模型级冷却、Until 非零）时写入；只查不写状态，不改变本分支语义。
+			if mb := h.cfg.Pool.ModelBlocked(bareModel); !mb.Until.IsZero() {
+				setRetryAfter(w, time.Until(mb.Until))
+			}
 		case upstream.ErrWafBlock:
 			if h.wafIP.active() {
 				// IP 级拦截措辞（fail-fast 终止路径）：网关出口 IP 被 WAF 拦截、
@@ -1178,11 +1190,60 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if s := strings.TrimSpace(modelBlock.Reason); s != "" {
 			hint += "; upstream: " + s
 		}
-		status = http.StatusBadRequest
+		status = h.modelBlockStatus(modelBlock)
+		if status == http.StatusServiceUnavailable {
+			// fork 宽限窗放行 503 时补一句本地说明：可重试是刻意的梯度容错，
+			// 不是调度器漏判——运维在日志里看到 503 + model_unavailable 不至于误报。
+			hint += "; gateway: within model_block_grace window, retry allowed until unblock"
+			// 放行重试的 503 必须给出节奏：Retry-After = 最早解封时刻（标准头，
+			// httpx/openai 客户端原生识别，避免客户端按自己的激进节奏盲试）。
+			setRetryAfter(w, time.Until(modelBlock.Until))
+		}
 	}
 	writeOpenAIErrorHint(w, status, code, msg, hint)
 	st.status = status
 	st.outcome = reqlog.OutcomeHTTPError
+}
+
+// setRetryAfter 写 Retry-After 响应头（秒，向上取整；fork 补丁）。
+//
+// 只在解封时刻确凿已知时调用——宁可缺省（客户端按自身策略退避）也不给猜测值：
+// 猜短了客户端白跑一趟（今天 12-15 点风暴里每次都是 70-100ms 本地拒绝），
+// 猜长了客户端平白等待。d<=0（已解封/无效）不写头。
+func setRetryAfter(w http.ResponseWriter, d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	// 整数秒向上取整（1.2s → 2s）：头部只有秒精度，向下取整会让客户端提前 0.2s 撞一次。
+	if s := int((d + time.Second - 1) / time.Second); s > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(s))
+	}
+}
+
+// modelBlockStatus 决定模型级全池阻塞（modelBlock.Blocked）的响应状态码
+// （fork 补丁：梯度容错，替代上游「一律 400」的一刀切）。
+//
+// 上游原行为（pool.model_block_grace=0，默认）：一律 400——"换号重试必然同样
+// 失败，客户端不该按可重试错误处理"。该论断在解封尚远时成立；但最早解封时刻
+// 已知且临近时（默认阈值内），400 与 503 的实际差别只剩几分钟：硬 400 让客户端
+// 停手，解封后需要人工重新发起请求；放行 503 可重试语义则让客户端按既有重试
+// 节奏自然过渡到恢复，无需人工介入。窗口本身限制了重试量的上界（今天 12-15 点
+// 那种 3 小时 2082 次的风暴不会复现——那发生在宽限窗之外，本补丁下仍是 400）。
+//
+// 判定：
+//   - grace <= 0（未开启）→ 400（上游原行为，逐字一致）
+//   - Until 为零值（上游未给重置时刻，无从判定"临近"）→ 400
+//   - 0 < time.Until(Until) <= grace → 503（可重试；hint 已带解封时刻）
+//   - 其余（解封更远 / 已过期）→ 400（过期条目下轮选号即恢复，无需放行重试）
+func (h *Handler) modelBlockStatus(mb pool.ModelBlockStatus) int {
+	grace := h.cfg.Pool.ModelBlockGrace()
+	if grace <= 0 || mb.Until.IsZero() {
+		return http.StatusBadRequest
+	}
+	if d := time.Until(mb.Until); d > 0 && d <= grace {
+		return http.StatusServiceUnavailable
+	}
+	return http.StatusBadRequest
 }
 
 // tokensPerSecond 计算吐字速率（token/s），返回 (速率, 是否有意义)。
