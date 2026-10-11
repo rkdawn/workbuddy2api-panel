@@ -58,6 +58,17 @@ func TestModelBlockStatusGradient(t *testing.T) {
 		}
 	})
 
+	t.Run("floor-involved combined state is always 400", func(t *testing.T) {
+		// 保底参与的组合态不享受宽限窗：保底解除是签到级事件，模型锁先到期
+		// 也选不上号（2026-10-11 glm-5.3 实案）。
+		p.SetModelBlockGrace(15 * time.Minute)
+		mb := pool.ModelBlockStatus{Blocked: true, Count: 6, FloorCount: 2,
+			Until: time.Now().Add(2 * time.Minute)}
+		if got := h.modelBlockStatus(mb); got != 400 {
+			t.Errorf("FloorCount>0 within grace: got %d want 400", got)
+		}
+	})
+
 	p.SetModelBlockGrace(15 * time.Minute)
 
 	t.Run("near unblock returns 503", func(t *testing.T) {

@@ -300,13 +300,20 @@ func (p *Pool) BlockModelClear(uid, model string) {
 
 // ModelBlockStatus 描述某模型在全池范围内因模型级冷却而不可选的情况。
 type ModelBlockStatus struct {
-	Blocked bool      // true = 每个非禁用账号都对该模型处于冷却中
+	Blocked bool      // true = 每个非禁用账号对该模型都不可选（模型冷却或积分保底）
 	Reason  string    // 冷却原因（通常为上游原文，如 "11102 model ... not found"）
 	Until   time.Time // 最早解封时间（零值 = 上游未给重置时刻）
-	Count   int       // 因此被挡的账号数
+	Count   int       // 因模型级冷却被挡的账号数
+	// FloorCount 未被模型冷却、但被积分保底拦住的账号数（仅收费模型，fork 组合态）。
+	// 2026-10-11 实案：glm-5.3 被 6004 锁 6 号，剩 2 号 credits=113/114 < floor=150
+	// 被保底拦——旧口径 Blocked=false（ModelBlocked 要求全池模型冷却），
+	// 两套机制互相看不见对方，请求落到通用 503 被客户端无限重试。
+	FloorCount int
+	// Servable 仍可正常选号的账号数。Blocked=true 当且仅当 Servable==0 且总数>0。
+	Servable int
 }
 
-// ModelBlocked 报告该模型是否在全池范围内被模型级冷却挡住。
+// ModelBlocked 报告该模型是否在全池范围内不可选（fork：模型冷却 ∪ 积分保底的组合判定）。
 //
 // 为什么需要它：选号失败时客户端只会拿到 no_healthy_account（"没有可用账号"），
 // 但真实原因常常是「号都在、只是都对这个模型关闭」。两者对调用方的处置完全不同
@@ -314,13 +321,17 @@ type ModelBlockStatus struct {
 // （lastErr 非空），一旦负缓存写入，后续请求 lastErr 为空，就只剩"池子没号"
 // （issue #102 附带发现 1）。上游原文与解封时间在那里被丢掉。
 //
-// 跨 realm 判定：调用方失败前已依次尝试过各域，所以只要有**任意**账号还能服务该
-// 模型，就不能算全池阻塞 —— 此时返回 Blocked=false，让上层继续用原有的
-// no_healthy_account 文案（选号失败另有原因：在途占满/积分保底/账号级冷却）。
+// 组合口径（fork）：账号分三类——模型冷却（Count）/ 保底拦截（FloorCount）/
+// 可正常服务（Servable）。**任何**一个可服务账号存在 → 不算阻塞（返回零值，
+// 让上层继续用原有的 no_healthy_account 文案）；可服务数为零且池内有非禁用号
+// → Blocked=true。只看模型冷却会漏掉「锁 6 个 + 保底拦 2 个」的组合态
+// （2026-10-11 glm-5.3 实案）；只看保底又会把「等 15 分钟就解锁」的暂时态
+// 误判成永久错。两者叠加才是「该模型此刻真的无号可派」的完整判据。
 //
-// 口径必须与选号一致：用 modelCooled 而非直接查 map，这样 AuditOnly 条目
-// （只审计不拦截）不会被误报成阻塞。
-func (p *Pool) ModelBlocked(model string) ModelBlockStatus {
+// 口径必须与选号一致：用 modelCooled 而非直接查 map（AuditOnly 条目只审计
+// 不拦截，不会被误报成阻塞）；保底用 floorBlockedForRealmModel（与 pick 同一
+// 判定函数，倍率按 (realm, 模型) 分桶）。
+func (p *Pool) ModelBlocked(model, realm string) ModelBlockStatus {
 	if model == "" {
 		return ModelBlockStatus{}
 	}
@@ -336,8 +347,14 @@ func (p *Pool) ModelBlocked(model string) ModelBlockStatus {
 			continue // 禁用/暂停号不参与：它们的不可用与模型无关
 		}
 		if !e.modelCooled(now, model) {
-			// 还有账号能服务这个模型 → 不是模型级阻塞。
-			return ModelBlockStatus{}
+			// 不在模型冷却中——fork：再看积分保底（与 pick 同判据）。
+			if p.floorBlockedForRealmModel(e, model, realm, now) {
+				st.FloorCount++
+			} else {
+				// 有账号能正常服务这个模型 → 不是全池阻塞。
+				return ModelBlockStatus{}
+			}
+			continue
 		}
 		st.Count++
 		if mc, ok := e.modelCooldowns[model]; ok {
@@ -350,7 +367,7 @@ func (p *Pool) ModelBlocked(model string) ModelBlockStatus {
 			}
 		}
 	}
-	if st.Count == 0 {
+	if st.Count+st.FloorCount == 0 {
 		// 池里压根没有非禁用账号：这是"真的没号"，不是模型问题。
 		return ModelBlockStatus{}
 	}

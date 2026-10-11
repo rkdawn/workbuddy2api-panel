@@ -48,11 +48,12 @@ func TestStatusCreditFloorZeroOff(t *testing.T) {
 	}
 }
 
-// TestCreditFloorBlocksPaidRequest 端到端：触底 + 实测收费模型 → 选号无候选，
-// 网关回 503（硬语义：宁 503 不打穿；免费模型照常可用）。
+// TestCreditFloorBlocksPaidRequest 端到端：触底 + 实测收费模型 → 选号无候选。
+// fork 语义（2026-10-11 实案驱动）：纯保底阻塞也构成全池不可选 → 400
+// insufficient_credits 不可重试（旧语义 503 可重试导致客户端无限重试风暴）。
 //
-// 诚实性约束：本用例的 upstream 是打不通的假上游，floor 开与关最终都回 503——
-// 若只断言 503，就无法区分「floor 拦的」与「上游不可达」，断言会被虚假原因满足。
+// 诚实性约束：本用例的 upstream 是打不通的假上游，floor 开与关最终都报错——
+// 若只断言状态码，就无法区分「floor 拦的」与「上游不可达」，断言会被虚假原因满足。
 // 真正证明拦截落在选号层的是**对照断言**：对照组（不开 floor）必须能选到 poor，
 // 实验组（开 floor）必须在同一条件下选不到号。
 func TestCreditFloorBlocksPaidRequest(t *testing.T) {
@@ -77,11 +78,11 @@ func TestCreditFloorBlocksPaidRequest(t *testing.T) {
 	h := NewHandler(Config{Pool: p, Upstream: upstream.New()})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
-	if rec.Code != 503 {
-		t.Fatalf("code=%d want 503（全池触底 + 收费模型 → 不放行）, body=%s", rec.Code, rec.Body)
+	if rec.Code != 400 {
+		t.Fatalf("code=%d want 400（全池触底 + 收费模型 → 不可重试硬错）, body=%s", rec.Code, rec.Body)
 	}
-	if !strings.Contains(rec.Body.String(), "no_healthy_account") {
-		t.Errorf("body=%s want no_healthy_account", rec.Body)
+	if !strings.Contains(rec.Body.String(), "insufficient_credits") {
+		t.Errorf("body=%s want insufficient_credits", rec.Body)
 	}
 }
 

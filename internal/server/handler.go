@@ -751,16 +751,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// （healthyForModel），realm 谓词过滤跨域账号。
 			acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, realm)
 		}
-		if acct == nil {
-			st.status = http.StatusServiceUnavailable
-			// 记下"是不是模型级阻塞"。选号返回 nil 有两种完全不同的成因：
-			//   (a) 池子真的没有可用号（账号级冷却/在途占满/积分保底）；
-			//   (b) 号都在，但每个号都对这个模型处于模型级冷却（11102/6004）。
-			// 两者此前都报 no_healthy_account，导致「模型不可用」被读成「号全挂了」。
-			// 在这里取一次快照，供下方错误构造区分（issue #102 附带发现 1）。
-			modelBlock = h.cfg.Pool.ModelBlocked(bareModel)
-			break
-		}
+	if acct == nil {
+		st.status = http.StatusServiceUnavailable
+		// 记下"是不是全池阻塞"。选号返回 nil 有多种成因：
+		//   (a) 池子真的没有可用号（账号级冷却/在途占满）；
+		//   (b) 号都在，但每个号都对这个模型处于模型级冷却（11102/6004）；
+		//   (c) fork 组合态：部分号模型冷却 + 其余号被积分保底拦住（2026-10-11
+		//       glm-5.3 实案：锁 6 号 + 剩余 2 号 credits<floor）。
+		// 三者此前都报 no_healthy_account，「模型不可用/没额度」被读成「号全挂了」。
+		// 在这里取一次快照，供下方错误构造区分（issue #102 附带发现 1）。
+		modelBlock = h.cfg.Pool.ModelBlocked(bareModel, realm)
+		break
+	}
 		st.uid = acct.UID
 		// 同步昵称：请求流水行只写 uid8 时无法直观看是哪一号，昵称随本次选号带入日志行。
 		st.nick = acct.Nickname
@@ -1143,7 +1145,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 上游已给、本地 modelCooldowns 已存，但此前的 429 响应不带任何
 			// 节奏信号，客户端只能按自身策略盲试。仅在解封时刻确凿已知（全池
 			// 模型级冷却、Until 非零）时写入；只查不写状态，不改变本分支语义。
-			if mb := h.cfg.Pool.ModelBlocked(bareModel); !mb.Until.IsZero() {
+			if mb := h.cfg.Pool.ModelBlocked(bareModel, realm); !mb.Until.IsZero() {
 				setRetryAfter(w, time.Until(mb.Until))
 			}
 		case upstream.ErrWafBlock:
@@ -1177,13 +1179,28 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 用 400 而非 503：这是"你选的这个模型当前不可用"，不是"服务端暂时过载"。
 	// 换号重试必然同样失败，客户端不该按可重试错误处理。
 	if modelBlock.Blocked {
-		code = "model_unavailable"
-		// 有上游原文时保留它（含 requestId，用户要拿去向上游反馈），只把"有几个号
-		// 被挡、最早何时解封"这类本地调度信息放进 gateway_hint。
-		if !upstreamMsgPassed {
-			msg = "model is unavailable on every account (per-model cooldown), try another model"
+		if modelBlock.FloorCount > 0 {
+			// fork 组合态：模型冷却 + 积分保底共同吃掉全部账号（2026-10-11
+			// glm-5.3 实案：6004 锁 6 号 + 剩余 2 号 credits<floor=150）。
+			// 用 400 而非 503：保底解除要等签到回血（小时级），与"解封临近"
+			// 无关——即使模型锁在宽限窗内到期，保底号依然选不上，放行重试
+			// 只会重演无意义的请求风暴。客户端该做的是换模型或等签到。
+			code = "insufficient_credits"
+			if !upstreamMsgPassed {
+				msg = "no account can serve this model: some are rate-limited, the rest are below the credit floor; wait for check-in or try another model"
+			}
+		} else {
+			code = "model_unavailable"
+			// 有上游原文时保留它（含 requestId，用户要拿去向上游反馈），只把"有几个号
+			// 被挡、最早何时解封"这类本地调度信息放进 gateway_hint。
+			if !upstreamMsgPassed {
+				msg = "model is unavailable on every account (per-model cooldown), try another model"
+			}
 		}
 		hint = fmt.Sprintf("model_blocked: %d account(s) cooling down this model", modelBlock.Count)
+		if modelBlock.FloorCount > 0 {
+			hint += fmt.Sprintf("; %d below credit floor", modelBlock.FloorCount)
+		}
 		if !modelBlock.Until.IsZero() {
 			hint += "; earliest unblock at " + modelBlock.Until.Format(time.RFC3339)
 		}
@@ -1236,6 +1253,12 @@ func setRetryAfter(w http.ResponseWriter, d time.Duration) {
 //   - 0 < time.Until(Until) <= grace → 503（可重试；hint 已带解封时刻）
 //   - 其余（解封更远 / 已过期）→ 400（过期条目下轮选号即恢复，无需放行重试）
 func (h *Handler) modelBlockStatus(mb pool.ModelBlockStatus) int {
+	// fork 组合态：保底参与的阻塞不享受宽限窗——保底解除是签到级的（小时级）
+	// 事件，即使模型锁先到期，保底号依然选不上，宽限 503 只会喂给客户端
+	// 一段注定失败的窗口。一律 400 不可重试。
+	if mb.FloorCount > 0 {
+		return http.StatusBadRequest
+	}
 	grace := h.cfg.Pool.ModelBlockGrace()
 	if grace <= 0 || mb.Until.IsZero() {
 		return http.StatusBadRequest

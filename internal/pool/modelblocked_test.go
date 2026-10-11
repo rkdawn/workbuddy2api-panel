@@ -28,7 +28,7 @@ func TestModelBlockedAllAccountsCooled(t *testing.T) {
 	}
 	p.mu.Unlock()
 
-	st := p.ModelBlocked("glm-5.3")
+	st := p.ModelBlocked("glm-5.3", "")
 	if !st.Blocked {
 		t.Fatalf("全部账号冷却时 Blocked 应为 true，得到 %+v", st)
 	}
@@ -56,7 +56,7 @@ func TestModelBlockedOneAccountStillServes(t *testing.T) {
 	}
 	p.mu.Unlock()
 
-	if st := p.ModelBlocked("glm-5.3"); st.Blocked {
+	if st := p.ModelBlocked("glm-5.3", ""); st.Blocked {
 		t.Fatalf("u2 仍可服务该模型，不应判定为模型级阻塞：%+v", st)
 	}
 	// 但 u2 对该模型无冷却这一点必须是真的（防止测试自身构造错误）。
@@ -81,7 +81,7 @@ func TestModelBlockedDisabledDoesNotCount(t *testing.T) {
 	p.byUID["u2"].disabled = true // 唯一还能服务的号被禁用了
 	p.mu.Unlock()
 
-	st := p.ModelBlocked("glm-5.3")
+	st := p.ModelBlocked("glm-5.3", "")
 	if !st.Blocked {
 		t.Fatalf("除禁用号外全部冷却 → 应判定为模型级阻塞，得到 %+v", st)
 	}
@@ -101,7 +101,7 @@ func TestModelBlockedAuditOnlyNotBlocking(t *testing.T) {
 	}
 	p.mu.Unlock()
 
-	if st := p.ModelBlocked("glm-5.3"); st.Blocked {
+	if st := p.ModelBlocked("glm-5.3", ""); st.Blocked {
 		t.Fatalf("AuditOnly 条目不得判定为阻塞：%+v", st)
 	}
 }
@@ -116,7 +116,7 @@ func TestModelBlockedExpiredNotBlocking(t *testing.T) {
 	}
 	p.mu.Unlock()
 
-	if st := p.ModelBlocked("glm-5.3"); st.Blocked {
+	if st := p.ModelBlocked("glm-5.3", ""); st.Blocked {
 		t.Fatalf("已过期冷却不得判定为阻塞：%+v", st)
 	}
 }
@@ -126,12 +126,12 @@ func TestModelBlockedExpiredNotBlocking(t *testing.T) {
 func TestModelBlockedEmptyInputs(t *testing.T) {
 	p := New("")
 	// 空池
-	if st := p.ModelBlocked("glm-5.3"); st.Blocked {
+	if st := p.ModelBlocked("glm-5.3", ""); st.Blocked {
 		t.Fatalf("空池不应判定为模型阻塞：%+v", st)
 	}
 	// 空模型名
 	p.Add(&auth.Auth{UID: "u1"})
-	if st := p.ModelBlocked(""); st.Blocked {
+	if st := p.ModelBlocked("", ""); st.Blocked {
 		t.Fatalf("空模型名不应判定为模型阻塞：%+v", st)
 	}
 }
@@ -143,7 +143,7 @@ func TestModelBlockedThenClear(t *testing.T) {
 	p.Add(&auth.Auth{UID: "u1"})
 
 	p.BlockModelBackoff("u1", "glm-5.3", "11102 model [glm-5.3] service info not found")
-	st := p.ModelBlocked("glm-5.3")
+	st := p.ModelBlocked("glm-5.3", "")
 	if !st.Blocked || st.Count != 1 {
 		t.Fatalf("写入负缓存后应阻塞：%+v", st)
 	}
@@ -152,7 +152,7 @@ func TestModelBlockedThenClear(t *testing.T) {
 	}
 
 	p.BlockModelClear("u1", "glm-5.3")
-	if st := p.ModelBlocked("glm-5.3"); st.Blocked {
+	if st := p.ModelBlocked("glm-5.3", ""); st.Blocked {
 		t.Fatalf("清除后不应再阻塞：%+v", st)
 	}
 }
@@ -171,11 +171,95 @@ func TestModelBlockedPausedDoesNotMaskBlock(t *testing.T) {
 	p.byUID["u2"].paused = true // 唯一「健康」的号在暂停让位
 	p.mu.Unlock()
 
-	st := p.ModelBlocked("glm-5.3")
+	st := p.ModelBlocked("glm-5.3", "")
 	if !st.Blocked {
 		t.Fatalf("暂停号不得掩盖模型级阻塞：%+v", st)
 	}
 	if st.Count != 1 {
 		t.Errorf("Count=%d want 1（暂停号不计入）", st.Count)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// fork 组合态：模型冷却 ∪ 积分保底（2026-10-11 glm-5.3 实案驱动）
+// 6004 锁 6 号 + 剩余 2 号 credits<floor=150 → 旧口径 Blocked=false，
+// 请求落到通用 503 被客户端无限重试。新口径：可服务数为零即 Blocked。
+// ---------------------------------------------------------------------------
+
+// TestModelBlockedCombinedLockPlusFloor 部分号模型冷却 + 其余号被保底拦 → Blocked，
+// Count/FloorCount/Servable 三方口径齐全。
+func TestModelBlockedCombinedLockPlusFloor(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.SetCreditFloor(150)
+	p.Add(&auth.Auth{UID: "locked"})
+	p.Add(&auth.Auth{UID: "poor"})
+	p.SetCredits("poor", 113, 0)
+	p.NoteModelCost("poor", "glm-5.3", 2.0, 1000) // 实测收费
+	p.mu.Lock()
+	p.byUID["locked"].modelCooldowns = map[string]modelCooldown{
+		"glm-5.3": {Until: time.Now().Add(2 * time.Hour), Reason: "6004 model rate limit"},
+	}
+	p.mu.Unlock()
+
+	st := p.ModelBlocked("glm-5.3", "")
+	if !st.Blocked {
+		t.Fatalf("锁 1 + 保底拦 1，无号可选，应判 Blocked：%+v", st)
+	}
+	if st.Count != 1 {
+		t.Errorf("Count=%d want 1（模型冷却）", st.Count)
+	}
+	if st.FloorCount != 1 {
+		t.Errorf("FloorCount=%d want 1（保底拦截）", st.FloorCount)
+	}
+	if st.Servable != 0 {
+		t.Errorf("Servable=%d want 0", st.Servable)
+	}
+	if !st.Until.IsZero() && time.Until(st.Until) > 2*time.Hour+time.Minute {
+		t.Errorf("Until 异常：%v", st.Until)
+	}
+}
+
+// TestModelBlockedCombinedButOneHealthy 组合态中只要有一个号真能服务 → 不算阻塞。
+func TestModelBlockedCombinedButOneHealthy(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.SetCreditFloor(150)
+	p.Add(&auth.Auth{UID: "locked"})
+	p.Add(&auth.Auth{UID: "poor"})
+	p.Add(&auth.Auth{UID: "rich"})
+	p.SetCredits("poor", 113, 0)
+	p.NoteModelCost("poor", "glm-5.3", 2.0, 1000)
+	p.SetCredits("rich", 1_000_000, 0)
+	p.NoteModelCost("rich", "glm-5.3", 2.0, 1000)
+	p.mu.Lock()
+	p.byUID["locked"].modelCooldowns = map[string]modelCooldown{
+		"glm-5.3": {Until: time.Now().Add(time.Hour)},
+	}
+	p.mu.Unlock()
+
+	if st := p.ModelBlocked("glm-5.3", ""); st.Blocked {
+		t.Fatalf("rich 可正常服务，不应判 Blocked：%+v", st)
+	}
+}
+
+// TestModelBlockedFloorFreeModelNotBlocking 保底只拦收费模型：触底号对免费模型
+// 照常可选，故不构成组合阻塞（口径与 pick 一致）。
+func TestModelBlockedFloorFreeModelNotBlocking(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.SetCreditFloor(150)
+	p.Add(&auth.Auth{UID: "locked"})
+	p.Add(&auth.Auth{UID: "poor"})
+	p.SetCredits("poor", 113, 0)
+	p.NoteModelCost("poor", "glm-5.3-flash", 0, 1000) // 实测免费
+	p.mu.Lock()
+	p.byUID["locked"].modelCooldowns = map[string]modelCooldown{
+		"glm-5.3-flash": {Until: time.Now().Add(time.Hour)},
+	}
+	p.mu.Unlock()
+
+	if st := p.ModelBlocked("glm-5.3-flash", ""); st.Blocked {
+		t.Fatalf("免费模型触底号可选，不应判 Blocked：%+v", st)
 	}
 }
