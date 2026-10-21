@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -28,7 +29,7 @@ func TestModelBlockedAllAccountsCooled(t *testing.T) {
 	}
 	p.mu.Unlock()
 
-	st := p.ModelBlocked("glm-5.3", "")
+	st := p.ModelBlocked("glm-5.3")
 	if !st.Blocked {
 		t.Fatalf("全部账号冷却时 Blocked 应为 true，得到 %+v", st)
 	}
@@ -56,7 +57,7 @@ func TestModelBlockedOneAccountStillServes(t *testing.T) {
 	}
 	p.mu.Unlock()
 
-	if st := p.ModelBlocked("glm-5.3", ""); st.Blocked {
+	if st := p.ModelBlocked("glm-5.3"); st.Blocked {
 		t.Fatalf("u2 仍可服务该模型，不应判定为模型级阻塞：%+v", st)
 	}
 	// 但 u2 对该模型无冷却这一点必须是真的（防止测试自身构造错误）。
@@ -65,6 +66,36 @@ func TestModelBlockedOneAccountStillServes(t *testing.T) {
 	p.mu.RUnlock()
 	if cooled {
 		t.Fatalf("测试构造有误：u2 不该对该模型冷却")
+	}
+}
+
+// TestModelBlockedForRealmIgnoresOtherRealm 模型请求分池后，另一域的账号不能
+// 掩盖本域全锁：global 两个号都被 11158 锁住时，即使 CN 号未锁也应返回 Blocked。
+func TestModelBlockedForRealmIgnoresOtherRealm(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "cn1", Domain: "www.codebuddy.cn"})
+	p.Add(&auth.Auth{UID: "g1", Domain: "www.workbuddy.ai"})
+	p.Add(&auth.Auth{UID: "g2", Domain: "www.workbuddy.ai"})
+	p.BlockModelBackoff("g1", "gpt-5.6-sol", "11158 model not allowed for account type")
+	p.BlockModelBackoff("g2", "gpt-5.6-sol", "11158 model not allowed for account type")
+
+	if st := p.ModelBlockedForRealm("gpt-5.6-sol", "global"); !st.Blocked || st.Count != 2 {
+		t.Fatalf("global 域应判定为全锁，得到 %+v", st)
+	} else if !strings.HasPrefix(st.Reason, "11158") {
+		t.Fatalf("模型锁原因应保留 11158，得到 %q", st.Reason)
+	}
+	if st := p.ModelBlockedForRealm("gpt-5.6-sol", "cn"); st.Blocked {
+		t.Fatalf("cn 域仍有可用账号，不应判定为全锁：%+v", st)
+	}
+	// 旧入口保持跨域口径，便于非分池调用方向后兼容。
+	if st := p.ModelBlocked("gpt-5.6-sol"); st.Blocked {
+		t.Fatalf("跨域仍有 cn1 可用，旧入口不应报全锁：%+v", st)
+	}
+	// 11158 与 11102 一样是确定性负缓存，权限恢复后成功请求必须能清除。
+	p.BlockModelClear("g1", "gpt-5.6-sol")
+	p.BlockModelClear("g2", "gpt-5.6-sol")
+	if st := p.ModelBlockedForRealm("gpt-5.6-sol", "global"); st.Blocked {
+		t.Fatalf("清除 11158 后不应再阻塞：%+v", st)
 	}
 }
 
@@ -81,7 +112,7 @@ func TestModelBlockedDisabledDoesNotCount(t *testing.T) {
 	p.byUID["u2"].disabled = true // 唯一还能服务的号被禁用了
 	p.mu.Unlock()
 
-	st := p.ModelBlocked("glm-5.3", "")
+	st := p.ModelBlocked("glm-5.3")
 	if !st.Blocked {
 		t.Fatalf("除禁用号外全部冷却 → 应判定为模型级阻塞，得到 %+v", st)
 	}
@@ -101,7 +132,7 @@ func TestModelBlockedAuditOnlyNotBlocking(t *testing.T) {
 	}
 	p.mu.Unlock()
 
-	if st := p.ModelBlocked("glm-5.3", ""); st.Blocked {
+	if st := p.ModelBlocked("glm-5.3"); st.Blocked {
 		t.Fatalf("AuditOnly 条目不得判定为阻塞：%+v", st)
 	}
 }
@@ -116,7 +147,7 @@ func TestModelBlockedExpiredNotBlocking(t *testing.T) {
 	}
 	p.mu.Unlock()
 
-	if st := p.ModelBlocked("glm-5.3", ""); st.Blocked {
+	if st := p.ModelBlocked("glm-5.3"); st.Blocked {
 		t.Fatalf("已过期冷却不得判定为阻塞：%+v", st)
 	}
 }
@@ -126,12 +157,12 @@ func TestModelBlockedExpiredNotBlocking(t *testing.T) {
 func TestModelBlockedEmptyInputs(t *testing.T) {
 	p := New("")
 	// 空池
-	if st := p.ModelBlocked("glm-5.3", ""); st.Blocked {
+	if st := p.ModelBlocked("glm-5.3"); st.Blocked {
 		t.Fatalf("空池不应判定为模型阻塞：%+v", st)
 	}
 	// 空模型名
 	p.Add(&auth.Auth{UID: "u1"})
-	if st := p.ModelBlocked("", ""); st.Blocked {
+	if st := p.ModelBlocked(""); st.Blocked {
 		t.Fatalf("空模型名不应判定为模型阻塞：%+v", st)
 	}
 }
@@ -143,7 +174,7 @@ func TestModelBlockedThenClear(t *testing.T) {
 	p.Add(&auth.Auth{UID: "u1"})
 
 	p.BlockModelBackoff("u1", "glm-5.3", "11102 model [glm-5.3] service info not found")
-	st := p.ModelBlocked("glm-5.3", "")
+	st := p.ModelBlocked("glm-5.3")
 	if !st.Blocked || st.Count != 1 {
 		t.Fatalf("写入负缓存后应阻塞：%+v", st)
 	}
@@ -152,7 +183,7 @@ func TestModelBlockedThenClear(t *testing.T) {
 	}
 
 	p.BlockModelClear("u1", "glm-5.3")
-	if st := p.ModelBlocked("glm-5.3", ""); st.Blocked {
+	if st := p.ModelBlocked("glm-5.3"); st.Blocked {
 		t.Fatalf("清除后不应再阻塞：%+v", st)
 	}
 }
@@ -171,7 +202,7 @@ func TestModelBlockedPausedDoesNotMaskBlock(t *testing.T) {
 	p.byUID["u2"].paused = true // 唯一「健康」的号在暂停让位
 	p.mu.Unlock()
 
-	st := p.ModelBlocked("glm-5.3", "")
+	st := p.ModelBlocked("glm-5.3")
 	if !st.Blocked {
 		t.Fatalf("暂停号不得掩盖模型级阻塞：%+v", st)
 	}
@@ -202,7 +233,7 @@ func TestModelBlockedCombinedLockPlusFloor(t *testing.T) {
 	}
 	p.mu.Unlock()
 
-	st := p.ModelBlocked("glm-5.3", "")
+	st := p.ModelBlocked("glm-5.3")
 	if !st.Blocked {
 		t.Fatalf("锁 1 + 保底拦 1，无号可选，应判 Blocked：%+v", st)
 	}
@@ -238,7 +269,7 @@ func TestModelBlockedCombinedButOneHealthy(t *testing.T) {
 	}
 	p.mu.Unlock()
 
-	if st := p.ModelBlocked("glm-5.3", ""); st.Blocked {
+	if st := p.ModelBlocked("glm-5.3"); st.Blocked {
 		t.Fatalf("rich 可正常服务，不应判 Blocked：%+v", st)
 	}
 }
@@ -259,7 +290,7 @@ func TestModelBlockedFloorFreeModelNotBlocking(t *testing.T) {
 	}
 	p.mu.Unlock()
 
-	if st := p.ModelBlocked("glm-5.3-flash", ""); st.Blocked {
+	if st := p.ModelBlocked("glm-5.3-flash"); st.Blocked {
 		t.Fatalf("免费模型触底号可选，不应判 Blocked：%+v", st)
 	}
 }
