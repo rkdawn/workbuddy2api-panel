@@ -255,6 +255,7 @@ function rateLimitMeta(row, now) {
   const until = parseAPITime(row && row.until);
   const deadline = resetAt || until;
   const remaining = deadline > now ? Math.round((deadline - now) / 1000) : 0;
+  let detail = '';
   if (kind === 'model_unavailable') {
     return {
       model,
